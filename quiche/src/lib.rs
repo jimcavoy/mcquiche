@@ -3649,6 +3649,15 @@ impl<F: BufFactory> Connection<F> {
                         }
                     },
 
+                    frame::Frame::McAck {
+                        flow_id: _,
+                        ack_delay: _,
+                        ranges,
+                    } =>
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.remove_ack_up_to(ranges.last());
+                        },
+
                     frame::Frame::CryptoHeader { offset, length } => {
                         self.crypto_ctx[epoch]
                             .crypto_stream

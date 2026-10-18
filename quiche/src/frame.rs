@@ -194,6 +194,12 @@ pub enum Frame {
         first_pn: u64,
         secret: Vec<u8>,
     },
+
+    McAck {
+        flow_id: Vec<u8>,
+        ack_delay: u64,
+        ranges: ranges::RangeSet,
+    },
 }
 
 impl Frame {
