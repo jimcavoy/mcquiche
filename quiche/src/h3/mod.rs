@@ -1669,6 +1669,124 @@ impl Connection {
         )
     }
 
+
+    /// Opens a unidirectional stream to carry a redirected HTTP/3 response
+    /// (`UNI_RESPONSE_STREAM_TYPE_ID`), prefixed with `correlation_id`, and
+    /// returns its stream ID.
+    ///
+    /// The response is then sent on the returned stream with
+    /// [`send_uni_response_headers()`] followed by [`send_body()`], exactly as
+    /// for a normal response. Unlike a normal response, this is delivered
+    /// independently of the request stream, which lets a single transmission be
+    /// shared by multiple receivers when the stream rides a shared flow (e.g.
+    /// multicast). The client matches the response to its request via
+    /// `correlation_id`, which it also learns from the redirect returned on the
+    /// request stream.
+    ///
+    /// The [`StreamBlocked`] error is returned when the underlying QUIC stream
+    /// doesn't have enough capacity to write the stream prefix. When this
+    /// happens the application should retry once the stream is writable again.
+    ///
+    /// [`send_uni_response_headers()`]:
+    ///     struct.Connection.html#method.send_uni_response_headers
+    /// [`send_body()`]: struct.Connection.html#method.send_body
+    /// [`StreamBlocked`]: enum.Error.html#variant.StreamBlocked
+    pub fn open_uni_response_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, correlation_id: u64,
+    ) -> Result<u64> {
+        let stream_id = self.next_uni_stream_id;
+
+        // Bookkeeping entry for the locally-initiated stream, marked as a
+        // redirected response stream so that HEADERS and body sends are
+        // permitted on it (see `send_uni_response_headers()` and
+        // `do_send_body()`).
+        let mut stream = stream::Stream::new(
+            stream_id,
+            true,
+            self.local_settings
+                .max_field_section_size
+                .unwrap_or(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
+            self.max_priority_update_size,
+        );
+        stream.set_local_uni_response();
+        self.streams.insert(stream_id, stream);
+
+        // Write the stream type followed by the correlation ID prefix. This
+        // also forces creation of the underlying QUIC stream state.
+        let mut d = [0; 16];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+        b.put_varint(stream::UNI_RESPONSE_STREAM_TYPE_ID)?;
+        b.put_varint(correlation_id)?;
+        let off = b.off();
+
+        if let Err(e) = conn.stream_send(stream_id, &d[..off], false) {
+            self.streams.remove(&stream_id);
+
+            if e == super::Error::Done {
+                return Err(Error::StreamBlocked);
+            }
+
+            return Err(e.into());
+        }
+
+        // Only advance the stream ID once the prefix has been buffered, to
+        // avoid skipping stream IDs.
+        self.next_uni_stream_id = self
+            .next_uni_stream_id
+            .checked_add(4)
+            .ok_or(Error::IdError)?;
+
+        Ok(stream_id)
+    }
+
+    /// Sends response HEADERS on a unidirectional response stream previously
+    /// opened with [`open_uni_response_stream()`].
+    ///
+    /// This is the [`send_response()`] equivalent for a redirected response
+    /// stream; the body is then sent with [`send_body()`] on the same stream.
+    ///
+    /// The headers are QPACK-encoded, but quiche's encoder never uses the QPACK
+    /// dynamic table — it emits blocks with Required Insert Count 0 using only
+    /// static-table indices and literals. Each HEADERS frame is therefore
+    /// self-contained and any receiver can decode it independently, without the
+    /// shared encoder-stream state that the dynamic table would require. That
+    /// makes this safe when the same stream is delivered to many receivers over
+    /// a shared flow, including receivers that join at different times.
+    ///
+    /// [`open_uni_response_stream()`]:
+    ///     struct.Connection.html#method.open_uni_response_stream
+    /// [`send_response()`]: struct.Connection.html#method.send_response
+    /// [`send_body()`]: struct.Connection.html#method.send_body
+    pub fn send_uni_response_headers<T: NameValue, F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
+        headers: &[T], fin: bool,
+    ) -> Result<()> {
+        // Ensure this is a redirected response stream we opened, and that its
+        // initial HEADERS have not already been sent.
+        match self.streams.get(&stream_id) {
+            Some(s) if matches!(s.ty(), Some(stream::Type::UniResponse)) => {
+                if s.local_initialized() {
+                    return Err(Error::FrameUnexpected);
+                }
+            },
+
+            _ => return Err(Error::FrameUnexpected),
+        };
+
+        self.send_headers(conn, stream_id, headers, fin)
+    }
+
+    /// Returns the correlation ID carried by a redirected response stream
+    /// (`UNI_RESPONSE_STREAM_TYPE_ID`), if `stream_id` is such a stream and its
+    /// correlation ID has been read.
+    ///
+    /// A client uses this to match a response arriving on a unidirectional
+    /// stream back to the request it redirected, by comparing against the
+    /// correlation ID returned in the redirect on the request stream.
+    pub fn uni_response_correlation_id(&self, stream_id: u64) -> Option<u64> {
+        self.streams.get(&stream_id)?.correlation_id()
+    }
+
     fn do_send_body<F, B, R, SND>(
         &mut self, conn: &mut super::Connection<F>, stream_id: u64, body: B,
         fin: bool, write_fn: SND,
@@ -1690,10 +1808,13 @@ impl Connection {
 
         let len = body.as_ref().len();
 
-        // Validate that it is sane to send data on the stream.
-        if !stream_id.is_multiple_of(4) {
-            return Err(Error::FrameUnexpected);
-        }
+        // Validate that it is sane to send data on the stream. Body is allowed
+        // on request (bidirectional) streams and on locally-initiated
+        // redirected response streams (see `open_uni_response_stream()`).
+        let is_uni_response = matches!(
+            self.streams.get(&stream_id).and_then(|s| s.ty()),
+            Some(stream::Type::UniResponse)
+        );
 
         match self.streams.get_mut(&stream_id) {
             Some(s) => {
@@ -2735,6 +2856,21 @@ impl Connection {
                                 Some(stream_id);
                         },
 
+                        stream::Type::UniResponse => {
+                            // Extension: a redirected response stream. Reading
+                            // proceeds through the CorrelationId state and then
+                            // the response frames.
+                            // TODO(uni-response): register/track the response
+                            // stream, match it to its request via the
+                            // correlation ID, and gate on the negotiated
+                            // setting.
+                            trace!(
+                                "{} open peer's redirected response stream {}",
+                                conn.trace_id(),
+                                stream_id
+                            );
+                        },
+
                         stream::Type::Unknown => {
                             // Unknown stream types are ignored.
                             // TODO: we MAY send STOP_SENDING
@@ -2754,6 +2890,23 @@ impl Connection {
                     };
 
                     if let Err(e) = stream.set_push_id(varint) {
+                        conn.close(true, e.to_wire(), b"")?;
+                        return Err(e);
+                    }
+                },
+
+                stream::State::CorrelationId => {
+                    stream.try_fill_buffer(conn)?;
+
+                    let varint = match stream.try_consume_varint() {
+                        Ok(v) => v,
+
+                        Err(_) => continue,
+                    };
+
+                    // TODO(uni-response): route the response stream to the
+                    // request that carried this correlation ID in its redirect.
+                    if let Err(e) = stream.set_correlation_id(varint) {
                         conn.close(true, e.to_wire(), b"")?;
                         return Err(e);
                     }
@@ -2971,7 +3124,9 @@ impl Connection {
         }
 
         match stream.ty() {
-            Some(stream::Type::Request) | Some(stream::Type::Push) => {
+            Some(stream::Type::Request) |
+            Some(stream::Type::Push) |
+            Some(stream::Type::UniResponse) => {
                 stream.finished();
 
                 self.finished_streams.push_back(stream_id);
@@ -3810,6 +3965,113 @@ mod tests {
     fn grease_value_in_varint_limit() {
         assert!(grease_value() < 2u64.pow(62) - 1);
     }
+
+
+    #[test]
+    /// Full redirected-response loop: the client makes a normal request, the
+    /// server answers on the request stream with a redirect carrying a
+    /// correlation ID, then delivers the actual response on a unidirectional
+    /// stream prefixed with that same ID. The client parses the uni stream back
+    /// into Headers/Data and matches it to the request via the correlation ID.
+    fn uni_response_stream() {
+        let (mut config, h3_config) = Session::default_configs().unwrap();
+        // Leave headroom over the handshake's uni streams (control, QPACK
+        // encoder/decoder, grease) for the response stream.
+        config.set_initial_max_streams_uni(10);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.handshake().unwrap();
+
+        let correlation_id = 0x1234u64;
+
+        // 1. Client makes a normal request on a bidirectional stream.
+        let (req_stream, req) = s.send_request(true).unwrap();
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((req_stream, Event::Headers {
+                list: req,
+                more_frames: false,
+            }))
+        );
+        assert_eq!(s.poll_server(), Ok((req_stream, Event::Finished)));
+
+        // 2. Server answers on the request stream with a redirect: a normal
+        //    response, no body, carrying the correlation ID in a header. The
+        //    actual content will follow on the redirected uni stream.
+        let cid = correlation_id.to_string();
+        let redirect = vec![
+            Header::new(b":status", b"200"),
+            Header::new(b"uni-response-id", cid.as_bytes()),
+        ];
+        s.server
+            .send_response(&mut s.pipe.server, req_stream, &redirect, true)
+            .unwrap();
+        s.advance().ok();
+
+        // Client reads the redirect and extracts the correlation ID from it.
+        let (rs, ev) = s.poll_client().unwrap();
+        assert_eq!(rs, req_stream);
+        let Event::Headers { list, .. } = ev else {
+            panic!("expected redirect headers, got {ev:?}");
+        };
+        let redirect_cid: u64 = list
+            .iter()
+            .find(|h| h.name() == b"uni-response-id")
+            .map(|h| std::str::from_utf8(h.value()).unwrap().parse().unwrap())
+            .expect("redirect carries a correlation ID");
+        assert_eq!(redirect_cid, correlation_id);
+        assert_eq!(s.poll_client(), Ok((req_stream, Event::Finished)));
+
+        // 3. Server delivers the actual response on the redirected uni stream:
+        //    the type + correlation ID prefix, then the usual HEADERS and DATA.
+        let resp = vec![
+            Header::new(b":status", b"200"),
+            Header::new(b"content-type", b"application/sdp"),
+        ];
+        let body: &[u8] = b"v=0 uni response body";
+
+        let uni_stream = s
+            .server
+            .open_uni_response_stream(&mut s.pipe.server, correlation_id)
+            .unwrap();
+        s.server
+            .send_uni_response_headers(
+                &mut s.pipe.server,
+                uni_stream,
+                &resp,
+                false,
+            )
+            .unwrap();
+        s.server
+            .send_body(&mut s.pipe.server, uni_stream, body, true)
+            .unwrap();
+        s.advance().ok();
+
+        // 4. Client parses the uni stream and matches it to the request via the
+        //    correlation ID it learned from the redirect.
+        assert_eq!(
+            s.poll_client(),
+            Ok((uni_stream, Event::Headers {
+                list: resp,
+                more_frames: true,
+            }))
+        );
+        assert_eq!(
+            s.client.uni_response_correlation_id(uni_stream),
+            Some(redirect_cid)
+        );
+
+        // Then the body arrives and reads back intact, followed by Finished.
+        assert_eq!(s.poll_client(), Ok((uni_stream, Event::Data)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        let mut recv = [0; 64];
+        let len = s.recv_body_client(uni_stream, &mut recv).unwrap();
+        assert_eq!(&recv[..len], body);
+
+        assert_eq!(s.poll_client(), Ok((uni_stream, Event::Finished)));
+    }
+
 
     #[test]
     fn h3_handshake_0rtt() {

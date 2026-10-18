@@ -416,6 +416,7 @@ pub enum CongestionControlAlgorithm {
         doc(cfg(feature = "congestion_window_unchecked_available"))
     )]
     CongestionWindowUnchecked = 5,
+    Disabled = 6,
 }
 
 impl FromStr for CongestionControlAlgorithm {
