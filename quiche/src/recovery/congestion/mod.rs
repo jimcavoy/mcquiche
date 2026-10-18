@@ -334,6 +334,7 @@ impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
             #[cfg(feature = "congestion_window_unchecked_available")]
             CongestionControlAlgorithm::CongestionWindowUnchecked =>
                 &CONGESTION_WINDOW_UNCHECKED,
+            CongestionControlAlgorithm::Disabled => &disabled::DISABLED,
         }
     }
 }
@@ -461,6 +462,7 @@ mod hystart;
 mod prr;
 pub(crate) mod recovery;
 mod reno;
+mod disabled;
 
 #[cfg(test)]
 mod test_sender;

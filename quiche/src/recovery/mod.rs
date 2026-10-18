@@ -426,6 +426,7 @@ impl FromStr for CongestionControlAlgorithm {
             #[cfg(feature = "congestion_window_unchecked_available")]
             "congestion_window_unchecked" =>
                 Ok(CongestionControlAlgorithm::CongestionWindowUnchecked),
+            "disabled" => Ok(CongestionControlAlgorithm::Disabled),
             _ => Err(crate::Error::CongestionControl),
         }
     }

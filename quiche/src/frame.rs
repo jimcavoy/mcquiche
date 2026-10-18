@@ -359,7 +359,20 @@ impl Frame {
                         (source_ipv4.into(), group_ipv4.into())
                     },
                     6 => {
-                        todo!("Add support for multicast QUIC IPv6");
+                        let source_ipv6: [u8; 16] = b
+                            .get_bytes(16)?
+                            .buf()
+                            .try_into()
+                            .map_err(|_| Error::BufferTooShort)?;
+                        let group_ipv6: [u8; 16] = b
+                            .get_bytes(16)?
+                            .buf()
+                            .try_into()
+                            .map_err(|_| Error::BufferTooShort)?;
+                        (
+                            net::Ipv6Addr::from(source_ipv6).into(),
+                            net::Ipv6Addr::from(group_ipv6).into(),
+                        )
                     },
                     _ => return Err(Error::InvalidFrame),
                 };
