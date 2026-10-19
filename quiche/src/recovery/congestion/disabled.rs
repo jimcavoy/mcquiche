@@ -28,7 +28,6 @@
 //!
 //! Note that Slow Start can use HyStart++ when enabled.
 
-use std::cmp;
 use std::time::Instant;
 
 use super::rtt::RttStats;
@@ -37,11 +36,10 @@ use super::Sent;
 
 use super::Congestion;
 use super::CongestionControlOps;
-use crate::recovery::LOSS_REDUCTION_FACTOR;
-use crate::recovery::MINIMUM_WINDOW_PACKETS;
 
 pub(crate) static DISABLED: CongestionControlOps = CongestionControlOps {
     on_init,
+    on_mtu_update,
     on_packet_sent,
     on_packets_acked,
     congestion_event,
@@ -53,6 +51,8 @@ pub(crate) static DISABLED: CongestionControlOps = CongestionControlOps {
 };
 
 pub fn on_init(_r: &mut Congestion) {}
+
+pub fn on_mtu_update(congestion: &mut Congestion) {}
 
 pub fn on_packet_sent(
     _r: &mut Congestion, _sent_bytes: usize, _bytes_in_flight: usize,
